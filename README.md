@@ -1,4 +1,4 @@
-# GTD GPT
+# GTD GPT (Best AI Chatbot Ever)
 
 GTD GPT is a Discord bot designed for [Studs Studioz](https://discord.gg/XAJthkYArx) which brings characters from Generic TD into Discord where members can talk and ask questions.
 
@@ -7,7 +7,7 @@ GTD GPT is a Discord bot designed for [Studs Studioz](https://discord.gg/XAJthkY
 To add a new character, or to edit an existing character, go to /characters/ and add a new _.txt file \*(replace _ with the character name)\*, then stop then start `main.py` (or restart the container) to see the new changes.
 Whatever you set \_.txt to will be the name of the slash command for that character. Example: `boxer.txt` -> `/boxer [message]`
 
-### Perquisites
+### Prerequisites
 
 - Ollama
   - You can download Ollama here: https://ollama.com/download
