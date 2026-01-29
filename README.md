@@ -18,7 +18,7 @@ Whatever you set \_.txt to will be the name of the slash command for that charac
 - Discord Application (bot)
 
 > [!IMPORTANT]
-> You will need basic docker & docker-compose knowledge **before** setup since there are no listed instructions here.
+> You will need basic docker, docker-compose & Discord Bot setup knowledge **before** setup since there are no listed instructions here.
 
 ### Environment
 

@@ -4,8 +4,10 @@ services:
   bot:
     build: .
     container_name: gtd_gpt
-    env_file:
-      - .env
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - GUILD_ID=${GUILD_ID}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
     restart: unless-stopped
     volumes:
       - ./characters:/app/characters
