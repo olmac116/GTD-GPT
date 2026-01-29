@@ -1,6 +1,6 @@
 # GTD GPT
 
-GTD GPT is a Discord bot designed for ([Studs Studioz](https://discord.gg/XAJthkYArx)) which brings characters from Generic TD into Discord where members can talk and ask questions.
+GTD GPT is a Discord bot designed for [Studs Studioz](https://discord.gg/XAJthkYArx) which brings characters from Generic TD into Discord where members can talk and ask questions.
 
 ### Add a Character
 
@@ -65,4 +65,4 @@ cd GTD-GPT
 - lolpleplays & Hbums
   - Permission to use characters from Generic TD for this project.
 
-Join ([Studs Studioz](https://discord.gg/XAJthkYArx)) to see this bot in action!
+Join [Studs Studioz](https://discord.gg/XAJthkYArx) to see this bot in action!
