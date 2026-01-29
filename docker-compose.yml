@@ -7,7 +7,4 @@ services:
       - GUILD_ID=${GUILD_ID}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
     restart: unless-stopped
-    volumes:
-      - ./characters:/app/characters
-      - ./baseSystem.txt:/app/baseSystem.txt:ro
     network_mode: host
