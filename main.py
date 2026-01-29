@@ -30,7 +30,10 @@ MEMORY_EXPIRY_SECONDS = 60 * 60 * 24
 DISCORD_MESSAGE_LIMIT = 2000
 
 CHARACTER_DIR = "characters"
-BASE_SYSTEM_FILE = "baseSystem.txt"
+BASE_SYSTEM_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "baseSystem.txt",
+)
 
 STARTING_MESSAGE = "Hmmm... let me think about that..."
 THINKING_MESSAGE = (
