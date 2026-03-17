@@ -4,9 +4,6 @@ GTD GPT is a Discord bot designed for [Studs Studioz](https://discord.gg/XAJthkY
 
 ### Add a Character
 
-<<<<<<< HEAD
-To add a new character, or to edit an existing character, go to /characters/ and add a new _.txt file _(replace \_ with the character name)_, then stop then start `main.py` (or restart the container) to see the new changes.
-=======
 To add a new character, or to edit an existing character, go to /characters/ and add:
 
 - A _.txt file \*(replace _ with the character name)\* for full character instructions.
@@ -14,7 +11,6 @@ To add a new character, or to edit an existing character, go to /characters/ and
 
 Then stop then start `main.py` (or restart the container) to see the new changes.
 
->>>>>>> fbbc350 (added random starting messages, responding messages, updated prompts,)
 Whatever you set \_.txt to will be the name of the slash command for that character. Example: `boxer.txt` -> `/boxer [message]`
 
 The matching JSON must include:
