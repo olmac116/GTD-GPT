@@ -190,7 +190,7 @@ async def stream_ollama(model: str, messages: List[Dict[str, str]]):
         "messages": messages,
         "stream": True,
         "think": False,
-        "keep_alive": "2m",
+        "keep_alive": "45m",
         "options": {
             "temperature": 0.7,
             "top_p": 0.9,
