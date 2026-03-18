@@ -199,7 +199,7 @@ async def stream_ollama(model: str, messages: List[Dict[str, str]]):
             "repeat_penalty": 1.1,
             "repeat_last_n": 64,
             "num_ctx": 4096,
-            "num_predict": 1024,
+            "num_predict": 120,
         },
     }
 
