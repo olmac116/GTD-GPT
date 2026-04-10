@@ -99,21 +99,27 @@ def load_character_config(character: str) -> Dict[str, str]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    character_name = data.get("character_name")
-    speech_style = data.get("specific_speech_style_or_tone")
+    display_name = data.get("display_name", data.get("character_name"))
+    character_summary = data.get("character_summary", data.get("detailed_character_description"))
+    voice_style = data.get("voice_style", data.get("specific_speech_style_or_tone"))
 
-    if not isinstance(character_name, str) or not character_name.strip():
+    if not isinstance(display_name, str) or not display_name.strip():
         raise ValueError(
-            f"Invalid 'character_name' in {character}.json."
+            f"Invalid 'display_name' in {character}.json."
         )
-    if not isinstance(speech_style, str) or not speech_style.strip():
+    if not isinstance(character_summary, str) or not character_summary.strip():
         raise ValueError(
-            f"Invalid 'specific_speech_style_or_tone' in {character}.json."
+            f"Invalid 'character_summary' in {character}.json."
+        )
+    if not isinstance(voice_style, str) or not voice_style.strip():
+        raise ValueError(
+            f"Invalid 'voice_style' in {character}.json."
         )
 
     return {
-        "character_name": character_name.strip(),
-        "specific_speech_style_or_tone": speech_style.strip(),
+        "display_name": display_name.strip(),
+        "character_summary": character_summary.strip(),
+        "voice_style": voice_style.strip(),
     }
 
 
@@ -121,11 +127,12 @@ def build_base_system_prompt(character: str) -> str:
     config = load_character_config(character)
     return (
         BASE_SYSTEM_TEMPLATE
-        .replace("[Character Name]", config["character_name"])
-        .replace(
-            "[specific speech style or tone]",
-            config["specific_speech_style_or_tone"],
-        )
+        .replace("[character_display_name]", config["display_name"])
+        .replace("[character_summary]", config["character_summary"])
+        .replace("[voice_style]", config["voice_style"])
+        .replace("[Character Name]", config["display_name"])
+        .replace("[detailed character description]", config["character_summary"])
+        .replace("[specific speech style or tone]", config["voice_style"])
     )
 
 
@@ -395,23 +402,8 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-@bot.command(name="clearmemory")
-async def clear_memory_prefix(ctx: commands.Context):
-    user_id = ctx.author.id
-    keys_to_remove = [key for key in conversation_memory.keys() if key[0] == user_id]
-    
-    for key in keys_to_remove:
-        conversation_memory.pop(key, None)
-        last_activity.pop(key, None)
-    
-    characters_cleared = len(keys_to_remove)
-    if characters_cleared > 0:
-        await ctx.send(f"Cleared your conversation memory for {characters_cleared} character(s).")
-    else:
-        await ctx.send("You don't have any conversation memory to clear.")
-
 @bot.tree.command(name="clearmemory", description="Clear your conversation memory with all characters")
-async def clear_memory_slash(interaction: discord.Interaction):
+async def clear_memory(interaction: discord.Interaction):
     user_id = interaction.user.id
     keys_to_remove = [key for key in conversation_memory.keys() if key[0] == user_id]
     
@@ -430,6 +422,11 @@ async def clear_memory_slash(interaction: discord.Interaction):
             "You don't have any conversation memory to clear.",
             ephemeral=True
         )
+
+@bot.tree.command(name="ping", description="Check the bot's latency")
+async def ping(interaction: discord.Interaction):
+    latency_ms = round(bot.latency * 1000)
+    await interaction.response.send_message(f"Pong! `{latency_ms}ms`", ephemeral=True)
 
 @bot.event
 async def on_ready():

@@ -1,4 +1,5 @@
 {
-  "character_name": "Witch",
-  "specific_speech_style_or_tone": "casual, energetic, and slightly overconfident"
+  "display_name": "Witch",
+  "character_summary": "a bright potion-using unit from Roblox Generic Tower Defense who helps allies with determination, support magic, and playful confidence",
+  "voice_style": "casual, lively, supportive, confident, and a little playful"
 }
