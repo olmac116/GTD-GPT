@@ -2,9 +2,16 @@ services:
   bot:
     build: .
     container_name: gtd_gpt
+    network_mode: host
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - GUILD_ID=${GUILD_ID}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://localhost:11434}
+      - PRIMARY_AI_BASE_URL=${PRIMARY_AI_BASE_URL:-}
+      - PRIMARY_AI_MODEL=${PRIMARY_AI_MODEL:-}
+      - PRIMARY_AI_SUPPORTS_IMAGES=${PRIMARY_AI_SUPPORTS_IMAGES:-false}
+      - FALLBACK_AI_BASE_URL=${FALLBACK_AI_BASE_URL:-http://localhost:11434}
+      - FALLBACK_AI_MODEL=${FALLBACK_AI_MODEL:-}
+      - FALLBACK_AI_SUPPORTS_IMAGES=${FALLBACK_AI_SUPPORTS_IMAGES:-true}
     restart: unless-stopped
-    network_mode: host

@@ -73,8 +73,9 @@ cd GTD-GPT
 ### Important Notes
 
 - Ollama must be accessible from inside the Docker container.
-  - On Mac/Windows, use `host.docker.internal`
-  - On Linux, use your Docker bridge IP or host networking
+  - This repo's default compose setup uses host networking on Linux, so `http://localhost:11434` works when Ollama is running on the host.
+  - If you are using Docker Desktop or a bridge network, prefer `http://host.docker.internal:11434` and let the bot fall back to the host-gateway alias.
+  - If you switch back to bridge networking, use `host.docker.internal` on Mac/Windows or your Docker bridge IP on Linux.
 - Restart the container after adding or editing character files.
 - Docker Compose automatically loads environment variables from `.env`.
 - Make sure Ollama is serving, run `ollama serve` on your host machine.

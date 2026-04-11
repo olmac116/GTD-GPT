@@ -3,8 +3,12 @@ import time
 import json
 import random
 import asyncio
+import base64
+import logging
+import sys
 from collections import defaultdict, deque
-from typing import Dict, Tuple, Deque, List
+from typing import Dict, Tuple, Deque, List, Any
+from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
@@ -15,21 +19,39 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+
+logger = logging.getLogger("gtd_gpt")
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN not found in .env")
 
 GUILD_ID = os.getenv("GUILD_ID")
 
-OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_HOST_BASE_URL = os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
 OLLAMA_CHAT_ENDPOINT = "/api/chat"
+OLLAMA_GENERATE_ENDPOINT = "/api/generate"
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+
+PRIMARY_AI_BASE_URL = os.getenv("PRIMARY_AI_BASE_URL") or None
+PRIMARY_AI_MODEL = os.getenv("PRIMARY_AI_MODEL") or MODEL_NAME
+PRIMARY_AI_SUPPORTS_IMAGES = os.getenv("PRIMARY_AI_SUPPORTS_IMAGES") or "false"
+
+FALLBACK_AI_BASE_URL = os.getenv("FALLBACK_AI_BASE_URL") or DEFAULT_HOST_BASE_URL
+FALLBACK_AI_MODEL = os.getenv("FALLBACK_AI_MODEL") or MODEL_NAME
+FALLBACK_AI_SUPPORTS_IMAGES = os.getenv("FALLBACK_AI_SUPPORTS_IMAGES") or "true"
 
 MAX_MEMORY_TURNS = 8
 MEMORY_EXPIRY_SECONDS = 60 * 30 # 30 minutes of inactivity before memory expires
 DISCORD_MESSAGE_LIMIT = 2000
 MAX_TRAIL_MESSAGES = 3
+MAX_TEXT_ATTACHMENT_CHARS = 4000
 
 CHARACTER_DIR = "characters"
 BASE_SYSTEM_FILE = os.path.join(
@@ -44,9 +66,6 @@ STARTING_MESSAGES = [
     "Generating...",
     "One sec...",
 ]
-THINKING_MESSAGE = (
-    "I'm currently already thinking right now, give me a second and I'll get back to you."
-)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -61,8 +80,174 @@ last_activity: Dict[Tuple[int, str], float] = {}
 bot_message_character: Dict[int, Tuple[str, float]] = {}
 bot_message_trails: Dict[int, Deque[Dict[str, str]]] = {}
 
-ongoing_generation: Dict[str, bool] = defaultdict(bool)
 user_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+active_generations = 0
+active_generations_lock = asyncio.Lock()
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def normalize_ai_base_url(base_url: str) -> str:
+    cleaned = base_url.strip().rstrip("/")
+    for suffix in (OLLAMA_CHAT_ENDPOINT, OLLAMA_GENERATE_ENDPOINT, "/api"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip("/")
+    return cleaned
+
+
+def expand_ai_base_urls(base_url: str) -> List[str]:
+    normalized = normalize_ai_base_url(base_url)
+    candidates = [normalized]
+
+    parsed = urlparse(normalized)
+    if parsed.scheme and parsed.hostname in {"localhost", "127.0.0.1"}:
+        host_gateway = f"{parsed.scheme}://host.docker.internal"
+        if parsed.port:
+            host_gateway += f":{parsed.port}"
+        if host_gateway != normalized:
+            candidates.append(host_gateway)
+
+    deduped: List[str] = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def get_ai_servers() -> List[Dict[str, Any]]:
+    servers: List[Dict[str, Any]] = []
+
+    def add_server(name: str, base_url: str, model: str, supports_images: bool):
+        for index, candidate_base_url in enumerate(expand_ai_base_urls(base_url)):
+            server_name = name if index == 0 else f"{name}-host"
+            servers.append(
+                {
+                    "name": server_name,
+                    "base_url": candidate_base_url,
+                    "model": model,
+                    "supports_images": supports_images,
+                }
+            )
+
+    if PRIMARY_AI_BASE_URL:
+        add_server(
+            "primary",
+            PRIMARY_AI_BASE_URL,
+            PRIMARY_AI_MODEL,
+            env_bool("PRIMARY_AI_SUPPORTS_IMAGES", False),
+        )
+
+    add_server(
+        "fallback",
+        FALLBACK_AI_BASE_URL,
+        FALLBACK_AI_MODEL,
+        env_bool("FALLBACK_AI_SUPPORTS_IMAGES", True),
+    )
+
+    return servers
+
+
+def describe_ai_servers() -> str:
+    servers = get_ai_servers()
+    return ", ".join(
+        f"{server['name']}={normalize_ai_base_url(str(server['base_url']))}"
+        f"/{server['model']} images={server['supports_images']}"
+        for server in servers
+    )
+
+
+def _is_image_attachment(attachment: discord.Attachment) -> bool:
+    if attachment.content_type and attachment.content_type.startswith("image/"):
+        return True
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    _, ext = os.path.splitext(attachment.filename.casefold())
+    return ext in image_exts
+
+
+def _is_text_attachment(attachment: discord.Attachment) -> bool:
+    if attachment.content_type and attachment.content_type.startswith("text/"):
+        return True
+    text_exts = {
+        ".txt", ".md", ".py", ".json", ".yaml", ".yml", ".toml", ".csv",
+        ".ini", ".log", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".xml",
+        ".sql", ".sh",
+    }
+    _, ext = os.path.splitext(attachment.filename.casefold())
+    return ext in text_exts
+
+
+async def extract_attachment_payload(
+    attachments: List[discord.Attachment] | None,
+) -> Tuple[str, List[str], List[str]]:
+    if not attachments:
+        return "", [], []
+
+    text_blocks: List[str] = []
+    image_b64: List[str] = []
+    notes: List[str] = []
+    remaining = MAX_TEXT_ATTACHMENT_CHARS
+
+    for attachment in attachments:
+        if _is_image_attachment(attachment):
+            data = await attachment.read()
+            if not data:
+                continue
+            image_b64.append(base64.b64encode(data).decode("utf-8"))
+            continue
+
+        if _is_text_attachment(attachment):
+            if remaining <= 0:
+                notes.append("Text attachment limit reached; additional text attachments were skipped.")
+                continue
+
+            data = await attachment.read()
+            decoded = data.decode("utf-8", errors="replace")
+            if len(decoded) > remaining:
+                decoded = decoded[:remaining]
+                notes.append(f"Attachment '{attachment.filename}' was truncated to fit the 4000-character limit.")
+
+            text_blocks.append(f"[{attachment.filename}]\n{decoded}")
+            remaining -= len(decoded)
+            continue
+
+        notes.append(f"Attachment '{attachment.filename}' was ignored (unsupported type).")
+
+    combined_text = "\n\n".join(text_blocks).strip()
+    return combined_text, image_b64, notes
+
+
+def prepare_messages_for_server(
+    messages: List[Dict[str, Any]],
+    supports_images: bool,
+) -> List[Dict[str, Any]]:
+    if supports_images:
+        return messages
+
+    prepared: List[Dict[str, Any]] = []
+    for msg in messages:
+        cleaned = dict(msg)
+        cleaned.pop("images", None)
+        prepared.append(cleaned)
+    return prepared
+
+
+async def update_presence_for_generation(start: bool):
+    global active_generations
+    async with active_generations_lock:
+        if start:
+            active_generations += 1
+            if active_generations == 1:
+                await bot.change_presence(status=discord.Status.online)
+            return
+
+        active_generations = max(0, active_generations - 1)
+        if active_generations == 0:
+            await bot.change_presence(status=discord.Status.idle)
 
 def get_characters() -> List[str]:
     if not os.path.isdir(CHARACTER_DIR):
@@ -191,7 +376,15 @@ def split_message(text: str) -> List[str]:
 
     return chunks
 
-async def stream_ollama(model: str, messages: List[Dict[str, str]]):
+
+def format_response_message(character: str, content: str, responding: bool = False) -> str:
+    state = "is responding" if responding else "responded"
+    header = f"-# *{character}* {state}"
+    body_limit = max(0, DISCORD_MESSAGE_LIMIT - len(header) - 2)
+    body = content[-body_limit:] if body_limit and len(content) > body_limit else content
+    return f"{header}\n\n{body}" if body else header
+
+async def stream_ollama(base_url: str, model: str, messages: List[Dict[str, Any]]):
     payload = {
         "model": model,
         "messages": messages,
@@ -212,31 +405,115 @@ async def stream_ollama(model: str, messages: List[Dict[str, str]]):
 
     buffer = ""
 
+    normalized_base_url = normalize_ai_base_url(base_url)
+
+    async def stream_chat_response(resp: aiohttp.ClientResponse):
+        if resp.status != 200:
+            raise RuntimeError(f"Ollama HTTP {resp.status}")
+
+        async for chunk in resp.content.iter_any():
+            buffer_nonlocal[0] += chunk.decode("utf-8")
+
+            while "\n" in buffer_nonlocal[0]:
+                line, buffer_nonlocal[0] = buffer_nonlocal[0].split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                data = json.loads(line)
+
+                if data.get("done"):
+                    return
+
+                if "message" in data and "content" in data["message"]:
+                    yield data["message"]["content"]
+
+    async def stream_generate_response(resp: aiohttp.ClientResponse):
+        if resp.status != 200:
+            raise RuntimeError(f"Ollama HTTP {resp.status}")
+
+        async for chunk in resp.content.iter_any():
+            buffer_nonlocal[0] += chunk.decode("utf-8")
+
+            while "\n" in buffer_nonlocal[0]:
+                line, buffer_nonlocal[0] = buffer_nonlocal[0].split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                data = json.loads(line)
+
+                if data.get("done"):
+                    return
+
+                if "response" in data:
+                    yield data["response"]
+
+    buffer_nonlocal = [""]
+
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            OLLAMA_BASE_URL + OLLAMA_CHAT_ENDPOINT,
-            json=payload,
-            timeout=None,
-        ) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"Ollama HTTP {resp.status}")
+        for endpoint, parser in (
+            (OLLAMA_CHAT_ENDPOINT, stream_chat_response),
+            (OLLAMA_GENERATE_ENDPOINT, stream_generate_response),
+        ):
+            buffer_nonlocal[0] = ""
+            request_url = normalize_ai_base_url(base_url) + endpoint
+            logger.info("AI request start url=%s model=%s", request_url, model)
+            async with session.post(
+                request_url,
+                json=payload,
+                timeout=None,
+            ) as resp:
+                if resp.status == 404 and endpoint == OLLAMA_CHAT_ENDPOINT:
+                    logger.warning("AI request 404 at %s; trying fallback endpoint %s", request_url, OLLAMA_GENERATE_ENDPOINT)
+                    continue
 
-            async for chunk in resp.content.iter_any():
-                buffer += chunk.decode("utf-8")
+                logger.info("AI request response url=%s status=%s", request_url, resp.status)
+                async for token in parser(resp):
+                    yield token
+                return
 
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
+        raise RuntimeError("Ollama HTTP 404")
 
-                    data = json.loads(line)
 
-                    if data.get("done"):
-                        return
+async def stream_with_fallback(messages: List[Dict[str, Any]]):
+    last_error: Exception | None = None
 
-                    if "message" in data and "content" in data["message"]:
-                        yield data["message"]["content"]
+    for server in get_ai_servers():
+        got_any_tokens = False
+        prepared_messages = prepare_messages_for_server(
+            messages,
+            bool(server["supports_images"]),
+        )
+
+        logger.info(
+            "Trying AI server name=%s base_url=%s model=%s supports_images=%s",
+            server["name"],
+            normalize_ai_base_url(str(server["base_url"])),
+            server["model"],
+            server["supports_images"],
+        )
+
+        try:
+            async for token in stream_ollama(
+                str(server["base_url"]),
+                str(server["model"]),
+                prepared_messages,
+            ):
+                got_any_tokens = True
+                yield token
+            return
+        except Exception as e:
+            last_error = e
+            logger.exception("AI server failed name=%s base_url=%s model=%s", server["name"], server["base_url"], server["model"])
+            if got_any_tokens:
+                raise RuntimeError(
+                    f"Generation failed after partial output from {server['name']} server: {e}"
+                )
+
+    raise RuntimeError(
+        f"All AI servers failed. Last error: {last_error}"
+    )
 
 BASE_SYSTEM_TEMPLATE = load_base_system_prompt()
 
@@ -248,6 +525,7 @@ async def handle_character(
     character: str,
     message: str,
     context_trail: List[Dict[str, str]] | None = None,
+    attachments: List[discord.Attachment] | None = None,
 ):
     cleanup_expired_memory()
 
@@ -261,85 +539,115 @@ async def handle_character(
         await send_func(str(e))
         return
 
-    system_prompt = f"---SYSTEM PROMPT---\n\n{base_system_prompt}\n\n---CHARACTER INFORMATION---\n\n{character_prompt}"
+    system_prompt = (
+        f"---SYSTEM PROMPT---\n\n{base_system_prompt}"
+        f"\n\n---CHARACTER INFORMATION---\n\n{character_prompt}"
+        "\n\n---RESPONSE REQUIREMENTS---\n"
+        "- First, directly answer the user's latest message.\n"
+        "- Be specific to what the user asked; avoid vague filler.\n"
+        "- Keep the answer in-character and concise.\n"
+        "- If there are multiple questions, briefly answer each one.\n"
+    )
 
-    async with user_locks[character]:
-        if ongoing_generation[character]:
-            await send_func(THINKING_MESSAGE)
-            return
-
-        ongoing_generation[character] = True
-        await bot.change_presence(status=discord.Status.online)
+    async with user_locks[user_id]:
+        await update_presence_for_generation(start=True)
         thinking_msg = await send_func(random.choice(STARTING_MESSAGES))
-        
-        user = await bot.fetch_user(user_id)
 
-        memory = conversation_memory[key]
-        messages = [{"role": "system", "content": system_prompt}]
-        if context_trail is not None:
-            messages.extend(context_trail)
-        else:
-            messages.extend(memory)
-        messages.append({"role": "user", "content": f"{user.display_name} (@{user.name}) has asked: {message}.\n\n(to ping the user, use <@{user.id}>)"})
-
-        full_reply = ""
-        last_edit = time.monotonic()
+        logger.info(
+            "Character request start user_id=%s character=%s attachments=%s",
+            user_id,
+            character,
+            0 if not attachments else len(attachments),
+        )
 
         try:
-            async for token in stream_ollama(MODEL_NAME, messages):
-                full_reply += token
+            user = await bot.fetch_user(user_id)
+            attachment_text, attachment_images, attachment_notes = await extract_attachment_payload(attachments)
 
-                if time.monotonic() - last_edit > 0.6:
-                    await edit_func(
-                        thinking_msg,
-                        full_reply[-DISCORD_MESSAGE_LIMIT:],
-                    )
-                    last_edit = time.monotonic()
+            memory = conversation_memory[key]
+            messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+            if context_trail is not None:
+                messages.extend(context_trail)
+            else:
+                messages.extend(memory)
 
-        except Exception as e:
-            await edit_func(thinking_msg, f"Something went wrong while communicating to ollama: {e}")
-            ongoing_generation[character] = False
-            if not any(ongoing_generation.values()):
-                await bot.change_presence(status=discord.Status.idle)
-            return
-
-        if not full_reply.strip():
-            await edit_func(
-                thinking_msg,
-                "The model returned no output.",
+            requested_text = message.strip() if message.strip() else "[No text message provided.]"
+            user_content = (
+                f"Latest message from {user.display_name} (@{user.name}):\n"
+                f"{requested_text}\n\n"
+                "Respond to this exact message now before adding extra flavor.\n"
+                f"(To ping the user, use <@{user.id}>.)"
             )
-            ongoing_generation[character] = False
-            if not any(ongoing_generation.values()):
-                await bot.change_presence(status=discord.Status.idle)
-            return
+            if attachment_text:
+                user_content += f"\n\n---TEXT ATTACHMENTS---\n{attachment_text}"
+            if attachment_notes:
+                user_content += "\n\n---ATTACHMENT NOTES---\n" + "\n".join(attachment_notes)
 
-        memory.append({"role": "user", "content": message})
-        memory.append({"role": "assistant", "content": full_reply})
+            user_message: Dict[str, Any] = {"role": "user", "content": user_content}
+            if attachment_images:
+                user_message["images"] = attachment_images
+            messages.append(user_message)
 
-        trail_messages = [
-            {"role": m["role"], "content": m["content"]}
-            for m in messages
-            if m.get("role") in {"user", "assistant"}
-        ]
-        trail_messages.append({"role": "assistant", "content": full_reply})
-        trail = deque(trail_messages[-MAX_TRAIL_MESSAGES:], maxlen=MAX_TRAIL_MESSAGES)
+            full_reply = ""
+            last_edit = time.monotonic()
 
-        parts = split_message(full_reply)
+            try:
+                async for token in stream_with_fallback(messages):
+                    full_reply += token
 
-        first_reply_msg = await edit_func(thinking_msg, parts[0])
-        first_reply_id = first_reply_msg.id if first_reply_msg else thinking_msg.id
-        bot_message_character[first_reply_id] = (character, time.time())
-        bot_message_trails[first_reply_id] = deque(trail, maxlen=MAX_TRAIL_MESSAGES)
+                    if time.monotonic() - last_edit > 0.6:
+                        await edit_func(
+                            thinking_msg,
+                            format_response_message(character, full_reply, responding=True),
+                        )
+                        last_edit = time.monotonic()
 
-        for part in parts[1:]:
-            sent_msg = await send_func(part)
-            if sent_msg:
-                bot_message_character[sent_msg.id] = (character, time.time())
-                bot_message_trails[sent_msg.id] = deque(trail, maxlen=MAX_TRAIL_MESSAGES)
+            except Exception as e:
+                logger.exception("Character generation failed user_id=%s character=%s", user_id, character)
+                await edit_func(thinking_msg, f"Something went wrong while communicating to AI server: {e}")
+                return
 
-        ongoing_generation[character] = False
-        if not any(ongoing_generation.values()):
-            await bot.change_presence(status=discord.Status.idle)
+            if not full_reply.strip():
+                await edit_func(
+                    thinking_msg,
+                    "The model returned no output.",
+                )
+                return
+
+            memory_entry = message
+            if attachment_text:
+                memory_entry += "\n\n[Included text attachments]"
+            if attachment_images:
+                memory_entry += f"\n[Included {len(attachment_images)} image attachment(s)]"
+
+            memory.append({"role": "user", "content": memory_entry})
+            memory.append({"role": "assistant", "content": full_reply})
+
+            trail_messages = [
+                {"role": m["role"], "content": m["content"]}
+                for m in messages
+                if m.get("role") in {"user", "assistant"}
+            ]
+            trail_messages.append({"role": "assistant", "content": full_reply})
+            trail = deque(trail_messages[-MAX_TRAIL_MESSAGES:], maxlen=MAX_TRAIL_MESSAGES)
+
+            parts = split_message(full_reply)
+
+            first_reply_msg = await edit_func(
+                thinking_msg,
+                format_response_message(character, parts[0]),
+            )
+            first_reply_id = first_reply_msg.id if first_reply_msg else thinking_msg.id
+            bot_message_character[first_reply_id] = (character, time.time())
+            bot_message_trails[first_reply_id] = deque(trail, maxlen=MAX_TRAIL_MESSAGES)
+
+            for part in parts[1:]:
+                sent_msg = await send_func(format_response_message(character, part))
+                if sent_msg:
+                    bot_message_character[sent_msg.id] = (character, time.time())
+                    bot_message_trails[sent_msg.id] = deque(trail, maxlen=MAX_TRAIL_MESSAGES)
+        finally:
+            await update_presence_for_generation(start=False)
 
 
 def register_prefix_command(character: str):
@@ -350,6 +658,7 @@ def register_prefix_command(character: str):
             user_id=ctx.author.id,
             character=character,
             message=message,
+            attachments=list(ctx.message.attachments),
         )
 
     bot.command(name=character)(command)
@@ -357,7 +666,12 @@ def register_prefix_command(character: str):
 def register_slash_command(character: str):
     @bot.tree.command(name=character, description=f"Talk to {character}")
     @app_commands.describe(message=f"What do you want to say to {character}?")
-    async def slash(interaction: discord.Interaction, message: str):
+    @app_commands.describe(attachment="Optional image or text attachment to include")
+    async def slash(
+        interaction: discord.Interaction,
+        message: str,
+        attachment: discord.Attachment | None = None,
+    ):
         await interaction.response.defer()
         await handle_character(
             send_func=interaction.followup.send,
@@ -365,6 +679,7 @@ def register_slash_command(character: str):
             user_id=interaction.user.id,
             character=character,
             message=message,
+            attachments=[attachment] if attachment else None,
         )
 
 
@@ -389,7 +704,7 @@ async def on_message(message: discord.Message):
             if stored_trail:
                 context_trail = list(stored_trail)
 
-    if character_to_use and content_to_send:
+    if character_to_use and (content_to_send or message.attachments):
         await handle_character(
             send_func=lambda c: message.reply(c, mention_author=False),
             edit_func=lambda m, c: m.edit(content=c),
@@ -397,6 +712,7 @@ async def on_message(message: discord.Message):
             character=character_to_use,
             message=content_to_send,
             context_trail=context_trail,
+            attachments=list(message.attachments),
         )
         return
 
@@ -428,9 +744,37 @@ async def ping(interaction: discord.Interaction):
     latency_ms = round(bot.latency * 1000)
     await interaction.response.send_message(f"Pong! `{latency_ms}ms`", ephemeral=True)
 
+
+@bot.tree.command(name="help", description="Show how to use the bot")
+async def help_command(interaction: discord.Interaction):
+    characters = get_characters()
+    if not characters:
+        await interaction.response.send_message(
+            "No characters are currently available.",
+            ephemeral=True,
+        )
+        return
+
+    usage_examples = ", ".join(f"{character}, [prompt]" for character in characters)
+    slash_examples = "\n".join(f"/{character} [message] (optional attachment)" for character in characters)
+    character_list = ", ".join(characters)
+
+    help_text = (
+        "How to use this bot:\n\n"
+        f"1) Prefix style in chat: {usage_examples}\n"
+        f"2) Slash commands:\n{slash_examples}\n"
+        "3) Reply to any bot character message to continue that same character conversation\n"
+        "4) Attach images (if server supports images) and text files (up to 4000 total characters)\n\n"
+        f"Available characters: {character_list}"
+    )
+
+    await interaction.response.send_message(help_text, ephemeral=True)
+
 @bot.event
 async def on_ready():
     characters = get_characters()
+
+    logger.info("Bot starting with AI servers: %s", describe_ai_servers())
 
     for character in characters:
         register_prefix_command(character)
